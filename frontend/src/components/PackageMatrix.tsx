@@ -236,8 +236,31 @@ export default function PackageMatrix({ onAnalyzed }: { onAnalyzed?: (r: Analysi
             )}
             {!loading && rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-3 py-10 text-center text-slate-400">
-                  No packages match. Run <span className="font-mono text-slate-300">Re-index repos</span> first.
+                <td colSpan={8} className="px-4 py-8 text-center text-slate-400">
+                  {debouncedSearch || statusFilter ? (
+                    <>
+                      No packages match your filters. Clear the search box or set the status filter to{" "}
+                      <span className="font-semibold text-slate-300">All statuses</span>.
+                    </>
+                  ) : (
+                    <div className="mx-auto max-w-md space-y-1.5 text-left">
+                      <p className="text-center font-semibold text-slate-300">No packages indexed yet</p>
+                      <p>
+                        <span className="font-semibold text-sky-400">1.</span> Click{" "}
+                        <span className="font-mono text-slate-300">Re-index repos</span> (top right) — this clones
+                        the linux-on-ibm-z wiki and scripts and indexes every package.
+                      </p>
+                      <p>
+                        <span className="font-semibold text-sky-400">2.</span> Wait for it to finish — the header
+                        will show the chunk and package counts.
+                      </p>
+                      <p>
+                        <span className="font-semibold text-sky-400">3.</span> Click{" "}
+                        <span className="font-semibold text-sky-300">Analyze</span> on any package below to compare
+                        its wiki page with its build script.
+                      </p>
+                    </div>
+                  )}
                 </td>
               </tr>
             )}

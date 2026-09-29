@@ -97,6 +97,34 @@ export function latestResult(packageName: string, distro: Distro, signal?: Abort
   );
 }
 
+/** GET /api/results/{package}/latest/json - the full report as pretty JSON text. */
+export async function reportJson(
+  packageName: string,
+  distro: Distro,
+  signal?: AbortSignal,
+): Promise<string> {
+  const res = await fetch(
+    `${BASE}/api/results/${encodeURIComponent(packageName)}/latest/json?distro=${encodeURIComponent(distro)}`,
+    { signal, cache: "no-store" },
+  );
+  if (!res.ok) throw new ApiError(res.status, `JSON export failed: ${res.status} ${res.statusText}`);
+  return res.text();
+}
+
+/** GET /api/results/{package}/latest/audit/json - the strict audit schema as pretty JSON text. */
+export async function auditJson(
+  packageName: string,
+  distro: Distro,
+  signal?: AbortSignal,
+): Promise<string> {
+  const res = await fetch(
+    `${BASE}/api/results/${encodeURIComponent(packageName)}/latest/audit/json?distro=${encodeURIComponent(distro)}`,
+    { signal, cache: "no-store" },
+  );
+  if (!res.ok) throw new ApiError(res.status, `JSON export failed: ${res.status} ${res.statusText}`);
+  return res.text();
+}
+
 /** GET /health - liveness + index statistics for the header pill. */
 export function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   return request<HealthResponse>(`/health`, { signal });

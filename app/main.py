@@ -19,6 +19,7 @@ on analyze), which is what the tests and smoke scripts use.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app import __version__
@@ -408,6 +409,62 @@ async def latest_result_audit(
             detail=f"no stored report for {package!r} on {normalize_distro(distro).value}",
         )
     return report.audit
+
+
+def _json_response(payload: Any, filename: str, download: bool) -> Response:
+    body = json.dumps(payload, indent=2, ensure_ascii=False)
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'} if download else {}
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+def _safe_filename_part(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name) or "package"
+
+
+@app.get("/api/results/{package}/latest/json", tags=["analysis"])
+async def latest_result_json(
+    package: str,
+    services: ServicesDep,
+    _: AuthDep,
+    distro: Annotated[Distro, Query()] = Distro.UBUNTU,
+    download: Annotated[bool, Query(description="Send as a downloadable .json file")] = False,
+) -> Response:
+    """The latest full comparison report as formatted JSON."""
+    report = services.repository.latest_report(package, distro)
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no stored report for {package!r} on {normalize_distro(distro).value}",
+        )
+    stem = _safe_filename_part(package)
+    return _json_response(
+        report.model_dump(mode="json"),
+        f"{stem}-{normalize_distro(distro).value}-comparison.json",
+        download,
+    )
+
+
+@app.get("/api/results/{package}/latest/audit/json", tags=["analysis"])
+async def latest_result_audit_json(
+    package: str,
+    services: ServicesDep,
+    _: AuthDep,
+    distro: Annotated[Distro, Query()] = Distro.UBUNTU,
+    download: Annotated[bool, Query(description="Send as a downloadable .json file")] = False,
+) -> Response:
+    """The latest report in the strict audit JSON schema (DISC-xx findings)."""
+    report = services.repository.latest_report(package, distro)
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no stored report for {package!r} on {normalize_distro(distro).value}",
+        )
+    stem = _safe_filename_part(package)
+    return _json_response(
+        report.audit.model_dump(mode="json"),
+        f"{stem}-{normalize_distro(distro).value}-audit.json",
+        download,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience runner
