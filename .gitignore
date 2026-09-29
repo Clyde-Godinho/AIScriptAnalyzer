@@ -1,0 +1,25 @@
+# environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# local config
+.env
+.env.local
+
+# ingestion work dir: cloned repositories, vector store, SQLite database
+data/
+!data/.gitkeep
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
