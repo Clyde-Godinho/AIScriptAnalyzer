@@ -129,3 +129,25 @@ export async function auditJson(
 export function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   return request<HealthResponse>(`/health`, { signal });
 }
+
+/** POST /api/demo/seed - load sample demo packages into the analyzer. */
+export function seedDemo(signal?: AbortSignal): Promise<{ status: string; message: string; chunks_indexed: number }> {
+  return request<{ status: string; message: string; chunks_indexed: number }>(`/api/demo/seed`, {
+    method: "POST",
+    body: JSON.stringify({}),
+    signal,
+  });
+}
+
+/** POST /api/analyze/sandbox - test arbitrary wiki docs and scripts live in the sandbox. */
+export function analyzeSandbox(
+  payload: { package_name: string; distro: string; wiki_content: string; script_content: string },
+  signal?: AbortSignal,
+): Promise<AnalyzeResponse> {
+  return request<AnalyzeResponse>(`/api/analyze/sandbox`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+    signal,
+  });
+}
+

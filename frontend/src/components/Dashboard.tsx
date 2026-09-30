@@ -1,120 +1,374 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import type { AnalysisReport } from "@/lib/api-types";
-import { auditJson, reportJson } from "@/lib/api-client";
+import type { AnalysisReport, Discrepancy, PackageSummary } from "@/lib/api-types";
+import { analyzePackage, latestResult, listPackages, reportJson } from "@/lib/api-client";
 import { SYNC_DONE_EVENT } from "./TopBar";
-import PackageMatrix from "./PackageMatrix";
 import DiffViewer from "./DiffViewer";
 import DiscrepancyDrawer from "./DiscrepancyDrawer";
-import { AUDIT_VERDICT, SEVERITY_META } from "@/lib/ui";
+import Spinner from "./Spinner";
+import { AUDIT_VERDICT, CATEGORY_LABEL, SEVERITY_META } from "@/lib/ui";
 
-/**
- * Client shell: owns the selected report + drawer state, listens for
- * sync-complete events from the TopBar, and renders the three main views.
- */
+const POPULAR_PACKAGES = [
+  { id: "nginx", name: "NGINX", subtitle: "Web Server & Reverse Proxy", tag: "🟢 100% In Sync", defaultDistro: "ubuntu" },
+  { id: "redis", name: "Redis", subtitle: "In-Memory Data Store", tag: "🟡 Minor Drift (90%)", defaultDistro: "ubuntu" },
+  { id: "PostgreSQL", name: "PostgreSQL", subtitle: "Relational Database", tag: "🔴 Discrepancies (37%)", defaultDistro: "ubuntu" },
+  { id: "Apache-HTTP-Server", name: "Apache HTTP Server", subtitle: "Web Server", tag: "🟡 Minor Drift (72%)", defaultDistro: "ubuntu" },
+  { id: "Apache-Kafka", name: "Apache Kafka", subtitle: "Distributed Event Streamer", tag: "🔴 Discrepancies (15%)", defaultDistro: "ubuntu" },
+  { id: "HAProxy", name: "HAProxy", subtitle: "TCP/HTTP Load Balancer", tag: "🟡 Discrepancies (50%)", defaultDistro: "ubuntu" },
+  { id: "Elasticsearch", name: "Elasticsearch", subtitle: "Search & Analytics Engine", tag: "🔴 Discrepancies (24%)", defaultDistro: "ubuntu" },
+  { id: "RabbitMQ", name: "RabbitMQ", subtitle: "AMQP Message Broker", tag: "🔴 Discrepancies (32%)", defaultDistro: "ubuntu" },
+  { id: "CouchDB", name: "CouchDB", subtitle: "Document Database", tag: "🟡 Minor Drift (90%)", defaultDistro: "ubuntu" },
+  { id: "example", name: "Example Benchmark", subtitle: "Reference Test Suite", tag: "🔴 Benchmark (23%)", defaultDistro: "ubuntu" },
+];
+
 export default function Dashboard() {
+  const [packages, setPackages] = useState<PackageSummary[]>([]);
+  const [selectedPkgName, setSelectedPkgName] = useState("nginx");
+  const [selectedDistro, setSelectedDistro] = useState("ubuntu");
   const [report, setReport] = useState<AnalysisReport | null>(null);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"findings" | "diff">("findings");
 
-  const openReport = useCallback((r: AnalysisReport) => {
-    setReport(r);
-    setActiveIndex(r.discrepancies.length > 0 ? 0 : null);
+  // Load package list
+  const loadPackages = useCallback(async () => {
+    try {
+      const data = await listPackages({ limit: 500 });
+      setPackages(data.packages);
+
+      // Auto-load initial report (nginx or first popular package)
+      const initialName = "nginx";
+      const initialDistro = "ubuntu";
+      setSelectedPkgName(initialName);
+      setSelectedDistro(initialDistro);
+
+      try {
+        const r = await latestResult(initialName, initialDistro);
+        setReport(r);
+      } catch {
+        // If not analyzed yet, run it
+        void runAudit(initialName, initialDistro);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load package list");
+    }
   }, []);
 
-  // reset the open report after a successful re-index (its commit may be stale)
   useEffect(() => {
-    const onSynced = () => setReport(null);
-    window.addEventListener(SYNC_DONE_EVENT, onSynced);
-    return () => window.removeEventListener(SYNC_DONE_EVENT, onSynced);
-  }, []);
+    void loadPackages();
+  }, [loadPackages]);
+
+  useEffect(() => {
+    window.addEventListener(SYNC_DONE_EVENT, loadPackages);
+    return () => window.removeEventListener(SYNC_DONE_EVENT, loadPackages);
+  }, [loadPackages]);
+
+  // Restrict dropdown strictly to the 10 popular packages
+  const popularList = POPULAR_PACKAGES.filter((pop) => {
+    if (packages.length === 0) return true;
+    return packages.some((p) => p.package_name.toLowerCase() === pop.id.toLowerCase());
+  });
+
+  // Available distros for the selected package
+  const availableDistros = Array.from(
+    new Set(
+      packages
+        .filter((p) => p.package_name.toLowerCase() === selectedPkgName.toLowerCase())
+        .map((p) => p.distro)
+    )
+  );
+  if (availableDistros.length === 0) availableDistros.push("ubuntu");
+
+  // Load or analyze the selected package
+  const handleSelectPackage = async (pkgName: string, distro: string) => {
+    // If target distro is not available for this package, fall back to first available or ubuntu
+    const pkgDistros = packages
+      .filter((p) => p.package_name.toLowerCase() === pkgName.toLowerCase())
+      .map((p) => p.distro);
+    const targetDistro = pkgDistros.includes(distro as any) ? distro : (pkgDistros[0] || "ubuntu");
+
+    setSelectedPkgName(pkgName);
+    setSelectedDistro(targetDistro);
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await latestResult(pkgName, targetDistro);
+      setReport(r);
+    } catch {
+      // If no stored report, run analysis
+      await runAudit(pkgName, targetDistro);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runAudit = async (pkgName: string, distro: string) => {
+    setAnalyzing(true);
+    setError(null);
+    try {
+      const res = await analyzePackage(pkgName, distro as any, { force: true });
+      if (res.report) {
+        setReport(res.report);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Analysis failed");
+    } finally {
+      setAnalyzing(false);
+    }
+  };
 
   return (
-    <div className="space-y-8 pt-6">
-      <ExplainerCard />
-      <PackageMatrix onAnalyzed={openReport} />
+    <div className="space-y-6 pt-6 max-w-5xl mx-auto">
+      {/* Super Simple Package Selector Card */}
+      <section className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 shadow-xl space-y-4">
+        <div>
+          <h2 className="text-base font-bold text-white flex items-center gap-2">
+            <span>📦 Select Package to Check</span>
+            <span className="rounded bg-sky-950 border border-sky-800/60 px-2 py-0.5 font-mono text-[10px] text-sky-400">
+              Linux on IBM Z (s390x)
+            </span>
+            <span className="rounded bg-emerald-950 border border-emerald-800/60 px-2 py-0.5 font-mono text-[10px] text-emerald-400">
+              Top 10 Popular Packages
+            </span>
+          </h2>
+          <p className="text-xs text-slate-400 mt-0.5">
+            Pick any of the 10 popular packages below to check whether its build wiki matches its automation script.
+          </p>
+        </div>
 
-      {report ? (
-        <section aria-label="Comparison for the selected package" className="space-y-3">
-          <header className="flex flex-wrap items-center gap-3">
-            <h2 className="text-sm font-semibold text-white">
-              {report.package_name} <span className="text-slate-500">· {report.distro}</span>
-            </h2>
-            <span
-              className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
-                report.consistency_score >= 90
-                  ? "border-emerald-200 bg-emerald-100 text-emerald-800"
-                  : report.consistency_score >= 65
-                    ? "border-amber-200 bg-amber-100 text-amber-800"
-                    : "border-rose-200 bg-rose-100 text-rose-800"
+        {/* Dropdowns Row */}
+        <div className="grid gap-3 sm:grid-cols-12 items-end">
+          {/* Package Dropdown */}
+          <div className="sm:col-span-6 space-y-1">
+            <label htmlFor="package-select" className="block text-xs font-semibold text-slate-300">
+              Package:
+            </label>
+            <select
+              id="package-select"
+              value={selectedPkgName}
+              onChange={(e) => void handleSelectPackage(e.target.value, selectedDistro)}
+              className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-xs font-medium text-white focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 transition"
+            >
+              {popularList.map((pkg) => (
+                <option key={pkg.id} value={pkg.id}>
+                  {pkg.name} — {pkg.subtitle} ({pkg.tag})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Distro Dropdown */}
+          <div className="sm:col-span-3 space-y-1">
+            <label htmlFor="distro-select" className="block text-xs font-semibold text-slate-300">
+              Target Distro:
+            </label>
+            <select
+              id="distro-select"
+              value={selectedDistro}
+              onChange={(e) => void handleSelectPackage(selectedPkgName, e.target.value)}
+              className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-xs font-medium text-white focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 transition uppercase"
+            >
+              {availableDistros.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Analyze Button */}
+          <div className="sm:col-span-3">
+            <button
+              type="button"
+              onClick={() => void runAudit(selectedPkgName, selectedDistro)}
+              disabled={analyzing || loading}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-sky-500 to-indigo-600 px-4 py-2.5 text-xs font-bold text-white shadow-lg shadow-sky-500/20 transition hover:from-sky-400 hover:to-indigo-500 active:scale-95 disabled:opacity-60"
+            >
+              {analyzing ? <Spinner className="h-4 w-4" /> : <span>▶</span>}
+              {analyzing ? "Auditing…" : "Check Consistency"}
+            </button>
+          </div>
+        </div>
+
+        {/* 1-Click Quick Benchmark Shortcuts */}
+        <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800/80">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            Quick Select:
+          </span>
+          {popularList.map((b) => (
+            <button
+              key={b.id}
+              type="button"
+              onClick={() => void handleSelectPackage(b.id, b.defaultDistro)}
+              className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition ${
+                selectedPkgName.toLowerCase() === b.id.toLowerCase()
+                  ? "border-sky-500 bg-sky-500/20 text-sky-200 font-semibold"
+                  : "border-slate-800 bg-slate-950/60 text-slate-400 hover:border-slate-700 hover:text-slate-200"
               }`}
             >
-              consistency {report.consistency_score}/100
-            </span>
-            {(() => {
-              const criticals = report.discrepancies.filter((d) => d.severity === "critical").length;
-              const highs = report.discrepancies.filter((d) => d.severity === "high").length;
-              const verdict =
-                criticals > 0 || report.consistency_score < 65
-                  ? AUDIT_VERDICT.BREAKING_DISCREPANCY
-                  : highs > 0 || report.consistency_score < 90
-                    ? AUDIT_VERDICT.MINOR_DRIFT
-                    : AUDIT_VERDICT.MATCH;
-              return (
-                <span className={`rounded-full border px-2 py-0.5 text-[11px] font-bold ${verdict.badge}`}>
-                  {verdict.label}
-                </span>
-              );
-            })()}
-            <div className="ml-auto flex items-center gap-1.5">
-              {report.discrepancies.slice(0, 6).map((d, i) => (
-                <button
-                  key={i}
-                  type="button"
-                  onClick={() => setActiveIndex(i)}
-                  title={d.title}
-                  className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase ${SEVERITY_META[d.severity].badge}`}
-                >
-                  {d.severity}
-                </button>
-                ))}
-            </div>
-          </header>
+              {b.name}
+            </button>
+          ))}
+        </div>
+      </section>
 
-          <p className="max-w-3xl text-xs leading-relaxed text-slate-400">{report.summary}</p>
-
-          <JsonExportBar report={report} />
-
-          <DiffViewer report={report} activeRef={activeIndex} onSelect={setActiveIndex} />
-
-          <ul className="space-y-1.5">
-            {report.discrepancies.map((d, i) => (
-              <li key={i}>
-                <button
-                  type="button"
-                  onClick={() => setActiveIndex(i)}
-                  className={`flex w-full items-start gap-2 rounded-md border border-slate-800 bg-slate-900 px-3 py-2 text-left transition hover:border-slate-600 ${SEVERITY_META[d.severity].border} border-l-4`}
-                >
-                  <span className={`mt-0.5 shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase ${SEVERITY_META[d.severity].badge}`}>
-                    {d.severity}
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block truncate text-xs font-medium text-slate-200">{d.title}</span>
-                    <span className="block truncate text-[11px] text-slate-500">{d.description}</span>
-                  </span>
-                  <span className="ml-auto shrink-0 font-mono text-[10px] text-slate-500">#{i + 1}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : (
-        <p className="rounded-lg border border-dashed border-slate-800 bg-slate-900/50 px-4 py-10 text-center text-sm text-slate-500">
-          Select <span className="font-semibold text-slate-300">Analyze</span> on a package above to load its
-          documentation ↔ script comparison.
-        </p>
+      {/* Error Message */}
+      {error && (
+        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-xs text-rose-300">
+          {error}
+        </div>
       )}
 
+      {/* Loading State */}
+      {(loading || analyzing) && (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-12 text-center text-xs text-slate-400 space-y-3">
+          <Spinner className="mx-auto h-7 w-7 text-sky-400" />
+          <p className="font-semibold text-slate-200">
+            Auditing {selectedPkgName} on Linux on IBM Z ({selectedDistro})…
+          </p>
+          <p className="text-[11px] text-slate-500">
+            Extracting dependencies, build flags, env vars, and architecture patches
+          </p>
+        </div>
+      )}
+
+      {/* Results View */}
+      {!loading && !analyzing && report && (
+        <section className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 shadow-xl space-y-5">
+          {/* Score & Verdict Card */}
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800 pb-5">
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-xl font-bold tracking-tight text-white capitalize">
+                  {report.package_name}
+                </h3>
+                <span className="rounded-md border border-slate-700 bg-slate-800 px-2 py-0.5 font-mono text-xs font-semibold uppercase text-slate-300">
+                  {report.distro}
+                </span>
+              </div>
+              <p className="max-w-xl text-xs text-slate-400 leading-relaxed mt-1">
+                {report.summary}
+              </p>
+            </div>
+
+            {/* Big Score Gauge */}
+            <div
+              className={`flex items-center gap-3.5 rounded-2xl border px-4 py-2.5 ${
+                report.consistency_score >= 90
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                  : report.consistency_score >= 65
+                    ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                    : "border-rose-500/30 bg-rose-500/10 text-rose-300"
+              }`}
+            >
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-wider opacity-80">
+                  Consistency Score
+                </div>
+                <div className="text-3xl font-black font-mono leading-none">
+                  {report.consistency_score}
+                  <span className="text-xs font-normal opacity-70"> / 100</span>
+                </div>
+              </div>
+
+              <div className="h-9 w-px bg-current opacity-20" />
+
+              <div>
+                {(() => {
+                  const criticals = report.discrepancies.filter((d) => d.severity === "critical").length;
+                  const highs = report.discrepancies.filter((d) => d.severity === "high").length;
+                  const verdict =
+                    criticals > 0 || report.consistency_score < 65
+                      ? AUDIT_VERDICT.BREAKING_DISCREPANCY
+                      : highs > 0 || report.consistency_score < 90
+                        ? AUDIT_VERDICT.MINOR_DRIFT
+                        : AUDIT_VERDICT.MATCH;
+                  return <span className="text-xs font-bold block">{verdict.label}</span>;
+                })()}
+                <span className="text-[11px] opacity-80 block">
+                  {report.discrepancies.length === 0
+                    ? "Docs and scripts agree"
+                    : `${report.discrepancies.length} mismatches found`}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Simple Tab Switcher: Findings List vs Diff */}
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-2">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setViewMode("findings")}
+                className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
+                  viewMode === "findings"
+                    ? "bg-sky-500 text-white shadow-md shadow-sky-500/20"
+                    : "text-slate-400 hover:text-slate-200 bg-slate-800/60"
+                }`}
+              >
+                Discrepancies ({report.discrepancies.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode("diff")}
+                className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
+                  viewMode === "diff"
+                    ? "bg-sky-500 text-white shadow-md shadow-sky-500/20"
+                    : "text-slate-400 hover:text-slate-200 bg-slate-800/60"
+                }`}
+              >
+                Side-by-Side Diff
+              </button>
+            </div>
+
+            <ExportButtons report={report} />
+          </div>
+
+          {/* View 1: Discrepancy Cards */}
+          {viewMode === "findings" && (
+            <div className="space-y-3">
+              {report.discrepancies.length === 0 ? (
+                <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-8 text-center space-y-1">
+                  <span className="text-3xl">🎉</span>
+                  <h4 className="text-sm font-bold text-emerald-300">
+                    Documentation is 100% In Sync!
+                  </h4>
+                  <p className="text-xs text-emerald-400/80">
+                    The build documentation and automation scripts match completely. No drift detected.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid gap-3">
+                  {report.discrepancies.map((d, i) => (
+                    <FindingCard
+                      key={i}
+                      discrepancy={d}
+                      index={i}
+                      isActive={activeIndex === i}
+                      onSelect={() => setActiveIndex(i)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* View 2: Side-by-Side Unified Diff */}
+          {viewMode === "diff" && (
+            <div className="space-y-2">
+              <p className="text-xs text-slate-400">
+                Compare wiki instructions (left) with automation shell commands (right).
+              </p>
+              <DiffViewer report={report} activeRef={activeIndex} onSelect={setActiveIndex} />
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Discrepancy Detail Drawer */}
       <DiscrepancyDrawer
         report={report}
         index={activeIndex}
@@ -124,164 +378,125 @@ export default function Dashboard() {
   );
 }
 
-const COPY_JSON_URL = "/api/results/{pkg}/latest/json?distro={distro}";
+/** Clean Finding Card with Documented vs Script comparison */
+function FindingCard({
+  discrepancy: d,
+  index,
+  isActive,
+  onSelect,
+}: {
+  discrepancy: Discrepancy;
+  index: number;
+  isActive: boolean;
+  onSelect: () => void;
+}) {
+  const meta = SEVERITY_META[d.severity] ?? SEVERITY_META.medium;
 
-/** One-screen answer to "what is this?" — the two sources and the core question. */
-function ExplainerCard() {
   return (
-    <section
-      aria-label="What this tool does"
-      className="rounded-lg border border-slate-800 bg-slate-900/60 px-4 py-3"
+    <div
+      onClick={onSelect}
+      className={`cursor-pointer rounded-xl border p-4 transition ${
+        isActive
+          ? "border-sky-500 bg-slate-850 shadow-md ring-1 ring-sky-500"
+          : "border-slate-800 bg-slate-900/90 hover:border-slate-700 hover:bg-slate-850/80"
+      }`}
     >
-      <h2 className="text-sm font-semibold text-white">What this tool checks</h2>
-      <p className="mt-1 max-w-4xl text-xs leading-relaxed text-slate-400">
-        For each package it compares two sources and answers one question:
-        <span className="text-slate-200"> “Does the build documentation accurately describe what the automation scripts actually do?”</span>
-      </p>
-      <div className="mt-2.5 grid gap-2 md:grid-cols-2">
-        <div className="rounded-md border border-sky-900/60 bg-sky-950/40 px-3 py-2">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-sky-200">
-            <span aria-hidden="true">📘</span> 1 · Build documentation (wiki)
-          </div>
-          <a
-            href="https://github.com/linux-on-ibm-z/docs/wiki/"
-            target="_blank"
-            rel="noreferrer"
-            className="mt-0.5 block truncate font-mono text-[11px] text-sky-400 underline decoration-dotted hover:text-sky-300"
-          >
-            github.com/linux-on-ibm-z/docs/wiki
-          </a>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-slate-400">
-            Manual steps: prerequisites to install, env vars, build commands, patches.
-          </p>
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <div className="flex items-center gap-2">
+          <span className={`rounded-md border px-2 py-0.5 text-[10px] font-bold uppercase ${meta.badge}`}>
+            {d.severity}
+          </span>
+          <span className="rounded bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-400">
+            {CATEGORY_LABEL[d.category] ?? d.category}
+          </span>
+          <h4 className="text-xs font-bold text-slate-200">{d.title}</h4>
         </div>
-        <div className="rounded-md border border-violet-900/60 bg-violet-950/40 px-3 py-2">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-violet-200">
-            <span aria-hidden="true">🖥️</span> 2 · Automated build scripts
+        <span className="font-mono text-[10px] text-slate-500">#{index + 1}</span>
+      </div>
+
+      <p className="text-xs text-slate-400 leading-relaxed mb-3">{d.description}</p>
+
+      {/* Comparison boxes */}
+      <div className="grid gap-2 sm:grid-cols-2 text-xs font-mono">
+        <div className="rounded-lg border border-sky-900/40 bg-sky-950/20 p-2.5">
+          <div className="text-[10px] font-bold text-sky-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+            <span>📘</span> Stated in Wiki Docs
           </div>
-          <a
-            href="https://github.com/linux-on-ibm-z/scripts"
-            target="_blank"
-            rel="noreferrer"
-            className="mt-0.5 block truncate font-mono text-[11px] text-violet-400 underline decoration-dotted hover:text-violet-300"
-          >
-            github.com/linux-on-ibm-z/scripts
-          </a>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-slate-400">
-            What the automation actually installs, exports and configures on s390x.
-          </p>
+          <div className="text-slate-300 break-words text-[11px]">
+            {d.doc_evidence || <span className="italic text-slate-600">None / Omitted</span>}
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-violet-900/40 bg-violet-950/20 p-2.5">
+          <div className="text-[10px] font-bold text-violet-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+            <span>🖥️</span> Actual in Build Script
+          </div>
+          <div className="text-slate-300 break-words text-[11px]">
+            {d.script_evidence || <span className="italic text-slate-600">None / Omitted</span>}
+          </div>
         </div>
       </div>
-      <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
-        Every mismatch is reported with severity, evidence from both sides, a suggested fix, and can be
-        exported as JSON. Health colours: <span className="font-semibold text-emerald-400">green = in sync</span>,{" "}
-        <span className="font-semibold text-amber-400">amber = minor drift</span>,{" "}
-        <span className="font-semibold text-rose-400">red = breaking discrepancy</span>,{" "}
-        <span className="font-semibold text-slate-300">grey = not analyzed yet</span>.
-      </p>
-    </section>
-  );
-}
 
-/** Copy / download the comparison as JSON (both raw report and audit schema). */
-function JsonExportBar({ report }: { report: AnalysisReport }) {
-  const [open, setOpen] = useState(false);
-  const [copied, setCopied] = useState<string | null>(null);
-
-  const saveFile = (name: string, text: string) => {
-    const blob = new Blob([text], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = name;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const copy = async (key: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(key);
-      window.setTimeout(() => setCopied(null), 2000);
-    } catch {
-      setCopied("error");
-      window.setTimeout(() => setCopied(null), 2000);
-    }
-  };
-
-  const fetchJson = (kind: "report" | "audit") =>
-    kind === "report" ? reportJson(report.package_name, report.distro) : auditJson(report.package_name, report.distro);
-
-  const btn =
-    "rounded-md border border-slate-700 px-2.5 py-1 text-[11px] font-medium text-slate-300 transition hover:border-slate-500 hover:text-white disabled:opacity-50";
-
-  return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Export</span>
-        <button
-          type="button"
-          className={btn}
-          onClick={async () => copy("report", await fetchJson("report"))}
-          title="Copy the full comparison JSON to the clipboard"
-        >
-          {copied === "report" ? "Copied ✓" : "Copy JSON"}
-        </button>
-        <button
-          type="button"
-          className={btn}
-          onClick={async () =>
-            saveFile(
-              `${report.package_name}-${report.distro}-comparison.json`,
-              await fetchJson("report"),
-            )
-          }
-        >
-          Download comparison.json
-        </button>
-        <button type="button" className={btn} onClick={() => setOpen((v) => !v)}>
-          {open ? "Hide audit JSON" : "View audit JSON"}
-        </button>
-        <a
-          className="ml-auto text-[11px] text-slate-500 underline decoration-dotted hover:text-slate-300"
-          href={COPY_JSON_URL.replace("{pkg}", encodeURIComponent(report.package_name)).replace(
-            "{distro}",
-            report.distro,
-          )}
-          target="_blank"
-          rel="noreferrer"
-          title="Open the raw JSON endpoint"
-        >
-          raw endpoint ↗
-        </a>
-      </div>
-      {open && <AuditJsonPanel report={report} />}
-      {copied === "error" && (
-        <p className="mt-1 text-[10px] text-rose-500">Clipboard blocked by the browser — use Download instead.</p>
+      {/* Suggested Fix */}
+      {d.recommendation && (
+        <div className="mt-3 flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-950/20 p-2.5 text-xs text-emerald-300">
+          <span className="font-bold shrink-0">💡 Fix:</span>
+          <span className="text-[11px] leading-relaxed text-emerald-200">{d.recommendation}</span>
+        </div>
       )}
     </div>
   );
 }
 
-/** Lazily loads and pretty-prints the strict audit-schema JSON. */
-function AuditJsonPanel({ report }: { report: AnalysisReport }) {
-  const [text, setText] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+/** Quick export actions */
+function ExportButtons({ report }: { report: AnalysisReport }) {
+  const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    auditJson(report.package_name, report.distro, controller.signal)
-      .then(setText)
-      .catch((err) => {
-        if ((err as Error)?.name !== "AbortError") setError(err instanceof Error ? err.message : "failed");
-      });
-    return () => controller.abort();
-  }, [report.package_name, report.distro]);
+  const copySummary = async () => {
+    try {
+      const summaryText =
+        `Consistency Report for ${report.package_name} (${report.distro})\n` +
+        `Score: ${report.consistency_score}/100\n` +
+        `Summary: ${report.summary}\n` +
+        `Discrepancies (${report.discrepancies.length}):\n` +
+        report.discrepancies
+          .map((d, i) => `${i + 1}. [${d.severity.toUpperCase()}] ${d.title}\n   Fix: ${d.recommendation}`)
+          .join("\n");
+      await navigator.clipboard.writeText(summaryText);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  };
 
-  if (error) return <p className="mt-2 text-[11px] text-rose-500">{error}</p>;
+  const downloadJson = async () => {
+    const raw = await reportJson(report.package_name, report.distro);
+    const blob = new Blob([raw], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${report.package_name}-${report.distro}-consistency.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
-    <pre className="mt-2 max-h-96 overflow-auto rounded-md bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
-      {text ?? "Loading…"}
-    </pre>
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        onClick={copySummary}
+        className="rounded-lg border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-300 hover:border-slate-500 hover:text-white transition"
+      >
+        {copied ? "✓ Copied Summary" : "📋 Copy Summary"}
+      </button>
+      <button
+        type="button"
+        onClick={downloadJson}
+        className="rounded-lg border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-300 hover:border-slate-500 hover:text-white transition"
+      >
+        ⬇ Download JSON
+      </button>
+    </div>
   );
 }

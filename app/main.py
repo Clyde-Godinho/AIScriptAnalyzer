@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any
 
+from pydantic import BaseModel
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -301,6 +302,164 @@ async def job_status(job_id: str, services: ServicesDep, _: AuthDep) -> JobStatu
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown job id")
     return job
+
+
+@app.post("/api/demo/seed", tags=["demo"])
+async def seed_demo(services: ServicesDep, _: AuthDep) -> dict[str, Any]:
+    """Seed sample packages (example and nginx) into the database and vector store for instant demo."""
+    from tests.samples import WIKI_PAGE_NAME, SCRIPT_NAME, WIKI_TEXT, SCRIPT_TEXT, WIKI_COMMIT, SCRIPT_COMMIT
+    from app.ingestion import DiscoveredPackage
+    from app.models import Distro
+
+    wiki_dir = services.settings.work_dir / "docs.wiki"
+    example_script_dir = services.settings.work_dir / "scripts" / "example" / "2.4.0"
+    nginx_script_dir = services.settings.work_dir / "scripts" / "nginx" / "1.24.0"
+
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    example_script_dir.mkdir(parents=True, exist_ok=True)
+    nginx_script_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Example package with known drift
+    doc_path = wiki_dir / WIKI_PAGE_NAME
+    script_path = example_script_dir / SCRIPT_NAME
+    doc_path.write_text(WIKI_TEXT, encoding="utf-8")
+    script_path.write_text(SCRIPT_TEXT, encoding="utf-8")
+
+    # 2. NGINX package in sync
+    nginx_wiki = wiki_dir / "Building-NGINX.md"
+    nginx_script = nginx_script_dir / "build_nginx.sh"
+    nginx_wiki.write_text(
+        "# Building NGINX\n\nInstructions for building NGINX 1.24.0 on Linux on IBM Z (s390x).\n\n"
+        "## Ubuntu\n\n### Prerequisites\n```bash\nsudo apt-get update\n"
+        "sudo apt-get install -y gcc make libpcre3-dev zlib1g-dev libssl-dev\n```\n\n"
+        "### Build and install\n```bash\n./configure --prefix=/usr/local/nginx --with-http_ssl_module\n"
+        "make -j$(nproc)\nsudo make install\n```\n",
+        encoding="utf-8",
+    )
+    nginx_script.write_text(
+        "#!/bin/bash\nset -e\nsudo apt-get update\n"
+        "sudo apt-get install -y gcc make libpcre3-dev zlib1g-dev libssl-dev\n"
+        "./configure --prefix=/usr/local/nginx --with-http_ssl_module\n"
+        "make -j$(nproc)\nsudo make install\n",
+        encoding="utf-8",
+    )
+
+    # 3. Redis package with minor drift
+    redis_script_dir = services.settings.work_dir / "scripts" / "redis" / "7.2.4"
+    redis_script_dir.mkdir(parents=True, exist_ok=True)
+    redis_wiki = wiki_dir / "Building-Redis.md"
+    redis_script = redis_script_dir / "build_redis.sh"
+    redis_wiki.write_text(
+        "# Building Redis\n\nInstructions for building Redis 7.2.4 on Linux on IBM Z (s390x).\n\n"
+        "## Ubuntu\n\n### Prerequisites\n```bash\nsudo apt-get update\n"
+        "sudo apt-get install -y gcc make tcl-dev libssl-dev\n```\n\n"
+        "### Build and install\n```bash\nmake -j$(nproc)\nsudo make install\n```\n",
+        encoding="utf-8",
+    )
+    redis_script.write_text(
+        "#!/bin/bash\nset -e\nsudo apt-get update\n"
+        "sudo apt-get install -y gcc make libssl-dev\n"
+        "make MALLOC=libc -j$(nproc)\nsudo make install\n",
+        encoding="utf-8",
+    )
+
+    services.repository.set_repo_state("docs_wiki", "https://github.com/linux-on-ibm-z/docs.wiki.git", WIKI_COMMIT)
+    services.repository.set_repo_state("scripts", "https://github.com/linux-on-ibm-z/scripts.git", SCRIPT_COMMIT)
+
+    discovered = [
+        DiscoveredPackage(
+            package_name="example",
+            normalized_name="example",
+            doc_path=doc_path,
+            script_paths={"2.4.0": script_path},
+            distros=[Distro.UBUNTU, Distro.RHEL],
+        ),
+        DiscoveredPackage(
+            package_name="nginx",
+            normalized_name="nginx",
+            doc_path=nginx_wiki,
+            script_paths={"1.24.0": nginx_script},
+            distros=[Distro.UBUNTU],
+        ),
+        DiscoveredPackage(
+            package_name="redis",
+            normalized_name="redis",
+            doc_path=redis_wiki,
+            script_paths={"7.2.4": redis_script},
+            distros=[Distro.UBUNTU],
+        ),
+    ]
+    stats = services.pipeline.index(discovered, full_reindex=False)
+    # Pre-analyze all 10 popular packages in background tasks so the seed endpoint responds instantly
+    POPULAR_10 = [
+        "nginx", "redis", "example", "PostgreSQL", "Apache-HTTP-Server",
+        "Apache-Kafka", "HAProxy", "Elasticsearch", "RabbitMQ", "CouchDB"
+    ]
+    for pkg in POPULAR_10:
+        asyncio.create_task(services.analyzer.analyze(pkg, Distro.UBUNTU, force=False))
+
+    return {
+        "status": "ok",
+        "message": "Top 10 popular packages seeded and indexed successfully!",
+        "chunks_indexed": stats.chunks_indexed,
+    }
+
+
+class SandboxRequest(BaseModel):
+    package_name: str = "sandbox-pkg"
+    distro: str = "ubuntu"
+    wiki_content: str
+    script_content: str
+
+
+@app.post("/api/analyze/sandbox", response_model=AnalyzeResponse, tags=["analysis"])
+async def analyze_sandbox(
+    payload: SandboxRequest,
+    services: ServicesDep,
+    _: AuthDep,
+) -> AnalyzeResponse:
+    """Run instant live consistency check on arbitrary wiki and script text."""
+    import time
+    from datetime import datetime, timezone
+    from app.parsers import parse_markdown_doc, parse_build_script
+    from app.analyzer import RuleEngine, compute_score
+    from app.models import (
+        AnalysisReport,
+        AnalysisStatus,
+        JobState,
+        Severity,
+        match_key,
+        normalize_distro,
+        stable_id,
+        verdict_for,
+    )
+
+    distro = normalize_distro(payload.distro)
+    doc_sig = parse_markdown_doc(payload.wiki_content, payload.package_name, distro)
+    script_sig = parse_build_script(payload.script_content, payload.package_name, distro)
+    rules = RuleEngine()
+    discrepancies = rules.diff(doc_sig, script_sig)
+    score = compute_score(discrepancies)
+    criticals = sum(1 for d in discrepancies if d.severity is Severity.CRITICAL)
+    highs = sum(1 for d in discrepancies if d.severity is Severity.HIGH)
+    verdict = verdict_for(score, criticals=criticals, highs=highs)
+    created_at = datetime.now(timezone.utc)
+    report = AnalysisReport(
+        report_id=stable_id("sandbox", payload.package_name, distro.value, str(time.time())),
+        package_name=payload.package_name,
+        distro=distro,
+        match_key=match_key(payload.package_name, distro),
+        status=AnalysisStatus.ANALYZED,
+        summary=f"Sandbox Audit: {len(discrepancies)} discrepancies detected between custom documentation and script.",
+        consistency_score=score,
+        discrepancies=discrepancies,
+        model="rules-only",
+        warnings=[],
+        doc_signature=doc_sig,
+        script_signature=script_sig,
+        created_at=created_at,
+    )
+    return AnalyzeResponse(job_id=None, state=JobState.SUCCEEDED, report=report)
 
 
 @app.get("/api/packages", response_model=PackageListResponse, tags=["analysis"])

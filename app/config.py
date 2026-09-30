@@ -81,6 +81,17 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # ------------------------------------------------------------------ #
+    @field_validator("api_token", mode="before")
+    @classmethod
+    def _clean_token(cls, value: object) -> object:
+        if isinstance(value, str):
+            v = value.strip()
+            if not v or v.startswith("#"):
+                return None
+            if " #" in v:
+                v = v.split(" #", 1)[0].strip()
+            return v or None
+        return value
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
